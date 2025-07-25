@@ -1,0 +1,930 @@
+#! /bin/bash
+
+PGRV=''
+PGV=$3
+PBIN=''
+ENVTYP=''
+USERHMDIR=''
+ISPRIMARY='Y'
+PICKEDTAR=''
+APPNM=$2
+PGDAT=''
+PGWL=''
+MEMT=0
+SWAPT=0
+PGSVC=''
+FXREPOLOC='/misc/software/database/postgres'
+REPOLOC=''
+PICKEDTAR=''
+PGPWD=`echo -n "YyNyI2Mjcw=="|base64 -d`
+NDID=1
+PRMNDNM=''
+EMAILID=''
+APW=''
+VUNTIL=''
+TLSPW=''
+HSNM=''
+CONNSTR=''
+FLSZ=''
+
+pg_set_repoloc()
+{
+  echo -e "\n[Info] Checking Repolocation \n"
+  chmod 755 /tmp/pgbuild.log
+ if [ -z "$REPOLOC" ]
+ then
+  REPOLOC='/misc/software/database/postgres'
+ fi
+}
+
+add_unv_dba_login_and_postgres_sudo_privs()
+{
+ echo -e "\n[Info] Login Enablement of postgres PAC group \n"
+
+   /usr/sbin/realm permit -g unv_postgres_dba_login@amer.dell.com
+
+   THIS_GROUP="unv_postgres_dba_login"
+   SUDOERS_FILE=/etc/sudoers.d/postgres_dbas
+   if [ ! -d /etc/sudoers.d ]
+   then
+    mkdir /etc/sudoers.d
+   fi
+
+echo \
+"# Postgres DBA's login access.  They log in with their
+# ADM accounts.  All DBA adm accounts are in the
+# unv_postgres_dba_login PAC group.  Being a member of this
+# PAC group entitles them to be able to
+# sudo su -l postgres.
+#cd
+%$THIS_GROUP  ALL = NOPASSWD: /bin/su -l postgres,/bin/su - postgres" > $SUDOERS_FILE
+
+ chmod 0440 $SUDOERS_FILE
+
+echo -e "#Postgres DBA's login access.  They log in with their
+# ADM accounts.  All DBA adm accounts are in the
+# unv_adm_login PAC group.  Being a member of this
+# PAC group entitles them to be able to
+# sudo su -l postgres.
+#
+Cmnd_Alias POSTGRES_SU1 = /bin/su -l postgres, /bin/su - postgres
+
+%unv_postgres_dba_login  ALL = NOPASSWD: POSTGRES_SU1
+
+# This allows the DBA's to
+#   sudo -i -u postgres <command>
+%unv_postgres_dba_login  ALL = (postgres) NOPASSWD: ALL" > /etc/sudoers.d/postgres_dba_sudoers_file
+
+echo -e "#ALLOW DBAS to RUN select scripts as root
+postgres ALL = NOPASSWD: /misc/software/linux/PostgresScripts/run_postgres_root
+%unv_postgres_dba_login ALL = (root) NOPASSWD: /misc/software/linux/PostgresScripts/run_postgres_root"  > /etc/sudoers.d/runpostgres_sudo
+
+ chmod 0440 /etc/sudoers.d/postgres_dba_sudoers_file /etc/sudoers.d/runpostgres_sudo
+
+}
+
+
+
+pg_useradd()
+{
+ echo -e "\n[Info] Creating Postgres Group and User\n"
+
+ groupadd -g 26 postgres
+ useradd -u 26 -g 26 -s /bin/bash postgres
+ usermod -d /apps/pgsql/pghome postgres
+ cp /home/postgres/.[zkb]* /apps/pgsql/pghome
+# useradd -u 26 -g 26 -d /apps/pgsql/pghome -s /bin/bash postgres
+ mkdir -p /apps/pgsql/pghome/admin/sh/ne
+ rm -fr /home/postgres
+ #chown -R postgres:postgres /apps
+ chown postgres:postgres /apps /apps/pgsql /apps/pgsql/pghome
+ chown -R postgres:postgres  /apps/pgsql/pghome
+ chmod 750 /apps/pgsql/pghome
+ chmod 774 /apps/pgsql/pghome/.[zkb]*
+ #chown -R postgres:postgres /apps/pgsql/pghome
+ USERHMDIR=`cat /etc/passwd|grep postgres|awk -F ":" '{print $6}'`
+ su - postgres << Eof
+  /misc/software/database/automation/tools/pyemail/pyemail_install.sh -install -db_type auto -auto
+Eof
+}
+
+pg_open_firewall_port()
+{
+echo -e "\n[Info] Opening Firewall Port\n"
+
+if [ `systemctl is-active firewalld` = "active"  ]
+then
+ firewall-cmd --zone=public --add-port=9432/tcp --permanent && systemctl restart firewalld
+fi
+echo "pg_open_firewall_port:$?" >> /tmp/pgbuild.log
+}
+
+
+pg_mem_calc()
+{
+echo -e "\n[Info] Memory Calculations for Postgres DB\n"
+
+MEMT=`cat /proc/meminfo|grep MemTotal|awk -F":" '{print $2}'|awk '{print $1}'`
+MEMT=`awk "BEGIN {print ($MEMT/1024^2)}"`
+MEMT=`awk 'BEGIN{printf "%.0f",'$MEMT'}'`
+SWAPT=`cat /proc/meminfo|grep SwapTotal|awk -F":" '{print $2}'|awk '{print $1}'`
+SWAPT=`awk "BEGIN {print ($SWAPT/1024^2)}"`
+SWAPT=`awk 'BEGIN{printf "%.0f",'$SWAPT'}'`
+}
+
+os_pkg_check()
+{
+ echo -e "\n[Info] Checking required OS package for Postgres/Postgres-Contrib/Pgbouncer Installation..\n"
+ #rpm -q perl perl-libs libevent python-psycopg2 c-ares
+ rpm -q perl perl-libs
+ if [ $? -eq 0 ]
+ then
+  echo -e "\nSeems all required OS packages have been installed .."
+ else
+  echo -e "\nPlease install above mentioned packages and retry . Exiting ..."
+  exit
+fi
+}
+
+
+pg_filesystem_setup()
+{
+ echo -e "\n[Info] Setting up Postgres Filesystem\n"
+
+ for fldlst in `mount|egrep "pgwal|pgdata|pgarchive|pgdump|pgtemp" |awk '{print $3}'`
+do
+  mkdir -p $fldlst/$APPNM
+ if [ `echo $fldlst|egrep "pgdata|pgwal"` ]
+    then chmod 700 "$fldlst"/$APPNM
+ fi
+done
+  mkdir -p /apps/pgsql/pghome/tlscert /apps/pgsql/pghome/.postgresql
+  chown postgres:postgres /apps/pgsql/pghome/tlscert /apps/pgsql/pghome/.postgresql
+  chmod 750 /apps/pgsql/pghome/tlscert /apps/pgsql/pghome/.postgresql
+  rm -fr /apps/pgsql/pgdata*/$APPNM/*
+  #chown -R postgres:postgres /apps
+  chown  postgres:postgres /apps /apps/pgsql
+  chown -R postgres:postgres /apps/pgsql/pghome
+  chown -R postgres:postgres /apps/pgsql/pgdump
+  chown -R postgres:postgres /apps/pgsql/pgtemp
+  chown -R postgres:postgres /apps/pgsql/pgdata01
+  chown -R postgres:postgres /apps/pgsql/pgwal
+  chown -R postgres:postgres /apps/pgsql/pgarchive
+}
+
+pg_service_change()
+{
+ echo -e "\n[Info] Changing Postgres Service definition file \n"
+ PGSVC=`ls -tr /usr/lib/systemd/system/postgresql-"$PGRV".service|tail -1`
+ PGDAT=`ls -td /apps/pgsql/pgdata*`
+ PGDAT=`echo $PGDAT/$APPNM`
+ PGWL=`ls -td /apps/pgsql/pgwal*`
+ PGWL=`echo $PGWL/$APPNM`
+# sed -i /Environment=PGDATA/s/^/#/ "$PGSVC"
+# sed -i  '32iEnvironment=PGDATA='$PGDAT/'' $PGSVC
+ DIRNM=`echo ${PGSVC#/usr/lib/systemd/system/}`.d
+ mkdir /etc/systemd/system/$DIRNM
+ echo "[Service]
+Environment=PGDATA=$PGDAT
+" > /etc/systemd/system/$DIRNM/override.conf
+ systemctl daemon-reload
+}
+
+pg_db_init_for_repl()
+{
+ echo -e "\n[Info] Creating Postgres Parameter and pg_hba.conf file and Initializing DB \n"
+
+sed -i /PGDATA/s/^/#/ `grep postgres /etc/passwd|awk -F ":" '{print $6}'``echo "/.bash_profile"`
+ sed -i /profile/s/^/#/ `grep postgres /etc/passwd|awk -F ":" '{print $6}'``echo "/.bash_profile"`
+ echo "export PGDATA=$PGDAT" >> `grep postgres /etc/passwd|awk -F ":" '{print $6}'``echo "/.bash_profile"`
+ echo "export PGPORT=9432" >> `grep postgres /etc/passwd|awk -F ":" '{print $6}'``echo "/.bash_profile"`
+ echo "export PATH=$PATH:/usr/`ls -d /usr/pgsql*|awk -F "/" '{print $3}'`/bin:/apps/pgsql/pghome/admin/sh" >> `grep postgres /etc/passwd|awk -F ":" '{print $6} '``echo "/.bash_profile"`
+ echo " PATH=$PATH:/usr/`ls -d /usr/pgsql*|awk -F "/" '{print $3}'`/bin" >> /etc/profile.d/custom.sh
+ echo " PS1='\$PWD:\$USER>'" >> /etc/profile.d/custom.sh
+ #echo "export PGHOST=`hostname`" >> /etc/profile.d/custom.sh
+ source /etc/profile.d/custom.sh
+ if [ "$ISPRIMARY" = 'Y' ]
+  then
+   export PGSETUP_INITDB_OPTIONS="--pgdata=$PGDAT --waldir=$PGWL --encoding=UTF-8 --locale=en_US.UTF-8"
+   postgresql-$PGRV-setup initdb
+   su - postgres <<Eof
+   echo "host    replication     all             0.0.0.0/0     md5" >> $PGDAT/pg_hba.conf
+   echo "host    all             all             0.0.0.0/0     md5" >> $PGDAT/pg_hba.conf
+   echo "include='init_postgres.conf'" >> $PGDAT/postgresql.conf
+   #sed -i 's/peer/trust/' $PGDAT/pg_hba.conf
+Eof
+cat<<Eof>$PGDAT/init_postgres.conf
+port=9432
+shared_buffers=`awk 'BEGIN{printf "%.0f",'$MEMT'*1024/4}'`MB
+wal_sync_method='fsync'
+password_encryption='md5'
+hot_standby = on
+wal_keep_segments = 50000
+archive_mode = on
+max_wal_senders = 10
+listen_addresses = '*'
+max_connections=500
+wal_level = logical
+wal_compression = on
+max_replication_slots = 10
+wal_log_hints = on
+checkpoint_completion_target = 0.9
+min_wal_size =10GB
+max_wal_size=20GB
+work_mem=8MB
+random_page_cost=1
+effective_io_concurrency = 200
+effective_cache_size=`awk 'BEGIN{printf "%.0f",'$MEMT'*1024/4*3}'`MB
+maintenance_work_mem=1GB
+log_min_duration_statement=2000
+archive_command = 'test ! -f /apps/pgsql/pgarchive/$APPNM/%f && cp %p /apps/pgsql/pgarchive/$APPNM/%f'
+shared_preload_libraries = 'repmgr,pg_stat_statements'
+idle_in_transaction_session_timeout = 5min
+autovacuum_vacuum_threshold=25
+autovacuum_vacuum_scale_factor=0.1
+autovacuum_analyze_scale_factor=0.05
+autovacuum_analyze_threshold=10
+autovacuum_vacuum_cost_limit=1000
+autovacuum_vacuum_cost_delay=-1
+log_line_prefix = '%m [%p] :[%e]:'
+Eof
+##Code Added to adjust Postgres 13 and future parameter changes ####
+
+if [ `cat $PGDAT/PG_VERSION` -gt 12 ]
+ then
+  echo "autovacuum_vacuum_insert_scale_factor = 0.1"  >> $PGDAT/init_postgres.conf
+  sed -i 's/wal_keep_segments = 50000/wal_keep_size = 10GB/g' $PGDAT/init_postgres.conf
+  if [ `cat $PGDAT/PG_VERSION` -ge 15 ]
+  then
+   sed -i "s/shared_preload_libraries = 'repmgr,pg_stat_statements'/shared_preload_libraries = 'repmgr,pg_stat_statements,vector'/g" $PGDAT/init_postgres.conf
+   fi
+ # echo "host    replication     all             0.0.0.0/0     scram-sha-256" >> $PGDAT/pg_hba.conf
+ # echo "host    all             all             0.0.0.0/0     scram-sha-256" >> $PGDAT/pg_hba.conf
+ #else
+ # echo "host    replication     all             0.0.0.0/0     md5" >> $PGDAT/pg_hba.conf
+ # echo "host    all             all             0.0.0.0/0     md5" >> $PGDAT/pg_hba.conf
+ fi
+ #  echo "include='init_postgres.conf'" >> $PGDAT/postgresql.conf
+ #  sed -i 's/peer/trust/' $PGDAT/pg_hba.conf
+ echo -e '#Activating LDAP Authentication If SSL in Use \n#hostssl    all          <svc_accountname>     0.0.0.0/0              ldap ldapserver="Ausdcamer.amer.dell.com pendcapac.apac.dell.com limdcemea.emea.dell.com"  ldapprefix="cn=" ldapsuffix=",OU=Service Accounts,DC=amer,DC=dell,DC=com" ldaptls=1\n#Activating LDAP Authentication If SSL not in Use\n#host    all          <svc_accountname>     0.0.0.0/0                 ldap ldapserver="Ausdcamer.amer.dell.com pendcapac.apac.dell.com limdcemea.emea.dell.com"  ldapprefix="cn=" ldapsuffix=",OU=Service Accounts,DC=amer,DC=dell,DC=com" ldaptls=1' >> $PGDAT/pg_hba.conf
+
+   chown postgres:postgres $PGDAT/init_postgres.conf $PGDAT/pg_hba.conf
+   chmod 600 $PGDAT/init_postgres.conf
+fi
+}
+
+pg_kernel_config()
+{
+echo -e "\n[Info] Setting up Kernel Parameters\n"
+
+OCR=`awk "BEGIN {print (($MEMT-$SWAPT)/$MEMT)*100}"|awk -F"." '{print $1}'`
+if [ $OCR -eq 0 -o $OCR -lt 0 ]
+then
+  OCR=90.0
+fi
+#echo "kernel.shmmax = `awk "BEGIN {print ($MEMT/2)*1024^3}"`"  >> /etc/sysctl.conf
+#echo "kernel.shmall = `awk "BEGIN {print ($MEMT*1024^3)/4096}"`" >>/etc/sysctl.conf
+cat <<Eof >> /etc/sysctl.conf
+kernel.sem = 250 32000 100 128
+kernel.panic_on_oops=1
+vm.overcommit_memory=2
+vm.overcommit_ratio=`awk 'BEGIN{printf "%.0f",'$OCR'}'`
+vm.swappiness =1
+vm.dirty_background_ratio = 3
+vm.dirty_ratio = 10
+fs.aio-max-nr=1048576
+Eof
+sysctl -p > /dev/null
+cat <<Eof >> /etc/security/limits.conf
+@postgres  soft  nproc  16384
+@postgres  hard  nproc  16384
+@postgres  soft  nofile 1024
+@postgres  hard  nofile 65536
+Eof
+}
+
+#pg_change_for_dev()
+#{
+#if [ "$ENVTYP" != 'PRD' ]
+#then
+#su - postgres <<Eof
+# sed -i 's/archive_mode = on/archive_mode = off/g' $PGDAT/init_postgres.conf
+# sed -i 's/wal_level = replica/wal_level = minimal/g' $PGDAT/init_postgres.conf
+# sed -i 's/hot_standby = on/hot_standby = off/g' $PGDAT/init_postgres.conf
+# sed -i 's/max_wal_senders = 10/max_wal_senders = 0/g' $PGDAT/init_postgres.conf
+# sed -i 's/wal_log_hints = on/wal_log_hints = off/g' $PGDAT/init_postgres.conf
+#Eof
+#fi
+#}
+
+
+pg_service_start()
+{
+ echo -e "\n[Info] Stating Postgres Service and Setting up Enviroment files\n"
+
+ PGSVC=`ls -t /usr/lib/systemd/system/postgresql-"$PGRV".service|tail -1`
+ systemctl enable `echo $PGSVC|awk -F"/" '{print $6}'` 2>/dev/null
+ systemctl start `echo $PGSVC|awk -F"/" '{print $6}'`
+
+if [ $? -eq 0 ]
+ then
+  echo -e "\n[Info] Successfully Started Postgres DB service \n"
+
+  echo " alias pgstop='sudo /usr/bin/systemctl stop `echo $PGSVC|awk -F"/" '{print $6}'|awk -F"." '{print $1'}`'" >> /etc/profile.d/custom.sh
+  echo " alias pgstart='sudo /usr/bin/systemctl start `echo $PGSVC|awk -F"/" '{print $6}'|awk -F"." '{print $1'}`'" >> /etc/profile.d/custom.sh
+  echo " alias pgstatus='sudo /usr/bin/systemctl status `echo $PGSVC|awk -F"/" '{print $6}'|awk -F"." '{print $1'}`'" >> /etc/profile.d/custom.sh
+  echo " alias pgrestart='sudo /usr/bin/systemctl restart `echo $PGSVC|awk -F"/" '{print $6}'|awk -F"." '{print $1'}`'" >> /etc/profile.d/custom.sh
+ # echo "alias agentstatus='sudo /usr/bin/systemctl status pemagent'" >> /etc/profile.d/custom.sh
+ # echo "alias agentstop='sudo /usr/bin/systemctl stop pemagent'" >> /etc/profile.d/custom.sh
+ # echo "alias agentstart='sudo /usr/bin/systemctl start pemagent'" >> /etc/profile.d/custom.sh
+  echo " alias pgreloadcfg='pg_ctl reload'" >> /etc/profile.d/custom.sh
+  sed -if '1s/^/if [[ $(id -u) -eq 26 ]]\nthen\n/' /etc/profile.d/custom.sh;echo "fi" >> /etc/profile.d/custom.sh
+  chmod 644 /etc/profile.d/custom.sh
+  source /etc/profile.d/custom.sh
+ else
+  echo -e "\n[Error] Failed to start Postgres DB service\n"
+fi
+}
+
+pg_install_rpms()
+{
+echo -e "\n[Info] Installing Required RPMs\n"
+
+osv=`cat /etc/system-release-cpe|awk -F":" '{print $3cut$5-c1}'`
+OSMJRL=`echo $osv|awk -F"oracle" '{print $2}'`
+if [ $OSMJRL -gt 7 ]
+then
+ #dnf module list --enabled python36 && echo Python36 already enabled || dnf module install -y python36
+ dnf install -y glibc-langpack-*
+fi
+FLTODOWNLOAD=`ls -t $FXREPOLOC/*.tar|awk -F"$FXREPOLOC/" '{print $2'}|grep -i "^postgres"|grep "$PGV"|grep -i "$osv"`
+/usr/bin/wget http://images-http.us.dell.com/images/database/postgres/$FLTODOWNLOAD -P $REPOLOC/
+PICKEDTAR=`ls -t $REPOLOC/*.tar|grep -i $osv|grep $PGV|grep -v grep`
+mkdir -p /tmp/$PGV
+tar xf $PICKEDTAR -C /tmp/$PGV/ --wildcards '*.rpm'
+tar xf $PICKEDTAR -C "$USERHMDIR"/admin/sh/ --wildcards '*.sh'
+tar xf $PICKEDTAR -C "$USERHMDIR"/admin/sh/ pgsha
+yum install -y /tmp/$PGV/*
+rm -fr /tmp/$PGV
+PGRV=`ls -t /usr/lib/systemd/system/postgresql*|tail -1|awk -F"/" '{print $6}'|awk -F"." '{print $1}'|awk -F "-" '{print $2}'`
+}
+
+
+pg_add_sudo_rules()
+{
+ echo -e "\n[Info] Adding sudo Rules\n"
+ PGREL=`ls -t /usr/lib/systemd/system/postgresql*|tail -1|awk -F"/" '{print $6}'|awk -F"." '{print $1}'`
+ cat<<Eof>/etc/sudoers.d/pgsudo
+postgres ALL = NOPASSWD: /usr/bin/yum localinstall -y postgresql*,/usr/bin/yum localinstall -y python*,/usr/bin/yum localinstall -y repmgr*,/usr/bin/yum localinstall -y pgbouncer*,/usr/bin/yum localinstall -y libevent*,/usr/bin/yum localinstall -y c-ares*,sudoedit /etc/systemd/system/pg-collectmetrics.timer,sudoedit /etc/systemd/system/pg-collectmetrics.service,sudoedit /etc/systemd/system/node-exporter.service,/usr/bin/systemctl * node-exporter.service,/usr/bin/systemctl * pg-collectmetrics.timer,/usr/bin/systemctl * pg-collectmetrics.service,/usr/bin/systemctl daemon-reload,sudoedit /etc/logrotate.d/postgres,sudoedit /etc/systemd/system/postgres*,/usr/pgsql*/bin/postgresql*-setup *,/usr/bin/systemctl * postgresql*,sudoedit /usr/lib/systemd/system/postgres*,sudoedit /usr/lib/systemd/system/repmgr*,sudoedit /usr/lib/systemd/system/pgbouncer*,/usr/bin/systemctl * repmgr*,/usr/bin/systemctl * pgbouncer*,sudoedit /etc/sudoers.d/pgsudo,/usr/bin/systemctl * firewalld,/usr/bin/firewall-cmd *,sudoedit /etc/systemd/system/repmgr*,sudoedit /etc/systemd/system/pgbouncer*,sudoedit /etc/systemd/system/postgresql*.d/override.conf,sudoedit /etc/systemd/system/repmgr*.d/override.conf
+Eof
+chmod 0440 /etc/sudoers.d/pgsudo
+echo postgres >> /etc/cron.allow
+}
+
+usage() {
+  printf "\n"
+  printf "Usage: pginstall standalone <4LetterApplicationName> <PGversion> <EnvType> <EmailId> <RepoLoc> \n"
+  printf "       pginstall replication <4LetterApplicationName> <PGversion> <SlvNodeID> <PrimaryNodeIp/Name> <EnvType> <EmailId> <RepoLoc>\n"
+  printf "Example:\n"
+  printf "For Standalone:   pginstall standalone devp 10.6 prd Debashis.Panigrahi@dell.com\n"
+  printf "For Replication:  pginstall replication devp 10.6 2 pgsprm01 prd Debashis.Panigrahi@dell.com\n"
+ }
+
+pg_crt_pgpass()
+{
+  echo -e "\n[Info] Creating Pgp file\n"
+  TLSPW=`echo 'RWY0NDV4dFFhU1VICg=='|base64 -d`
+  su - postgres <<Eof >/dev/null
+  echo "*:9432:postgres:postgres:$PGPWD" > ~/.pgpass
+  echo "*:9432:replication:postgres:$PGPWD" >> ~/.pgpass
+  echo "*:9432:tlscertdb:tlscrtusr:$TLSPW" >> ~/.pgpass
+  chmod 600 ~/.pgpass
+Eof
+}
+
+pg_certgen()
+{
+ echo -e "\n[Info] Configuring TLS Certificate and Setting up SSL for Database\n"
+ HSNM=`hostname -s`
+ PBIN=`ls -d /usr/pgsql-*/bin`
+ if [ "$ENVTYP" = "PRD" ]
+ then
+  #CONNSTR="postgres://tlscrtusr@pmsplpgdprddb01.us.dell.com:9432,pmsplpgdprddb02.us.dell.com:9432/tlscertdb?target_session_attrs=any"
+  CONNSTR="postgres://tlscrtusr@pmsplpgp1pr11.amer.dell.com:9432,pmsplpgs3pr11.amer.dell.com:9432/tlscertdb?target_session_attrs=any"
+   su -l postgres -c "(cd ~/tlscert && "$PBIN/psql" -t -q '$CONNSTR' -c \"select ltrim(cert) from tlscerts where servername like '%$HSNM%'\"|sed 's/^ //' > ~/tlscert/getall.pfx)"
+  su -l postgres -c "(cd ~/tlscert && "$PBIN/psql"  -t -q '$CONNSTR' -c \"select ltrim(key) from tlscerts where servername like '%$HSNM%'\"|sed 's/^ //' > ~/tlscert/kyfl)"
+ else
+   CONNSTR="postgres://tlscrtusr@pmsnlpgrrde11.amer.dell.com:9432/tlscertdb"
+   su -l postgres -c "(cd ~/tlscert && "$PBIN/psql" -t -q '$CONNSTR' -c \"select ltrim(cert) from tlscerts where servername like '%$HSNM%'\"|sed 's/^ //' > ~/tlscert/getall.pfx)"
+su -l postgres -c "(cd ~/tlscert && "$PBIN/psql" -t -q '$CONNSTR' -c \"select ltrim(key) from tlscerts where servername like '%$HSNM%'\"|sed 's/^ //' > ~/tlscert/kyfl)"
+ fi
+
+  su -l postgres<<'EOF'
+  cd ~/tlscert
+
+  FLSZ=`ls -l ~/tlscert/getall.pfx|awk '{print $5}'`
+ if [ -s ~/tlscert/getall.pfx -a "$FLSZ" -gt 2000 -a -s ~/tlscert/kyfl ]
+  then
+    cd ~/tlscert
+    openssl enc -base64 -A -d -in  ~/tlscert/getall.pfx -out  ~/tlscert/converted.pfx &&
+    openssl pkcs12 -in  ~/tlscert/converted.pfx -nocerts -out ~/tlscert/server.key -nodes -passin file:/apps/pgsql/pghome/tlscert/kyfl &&
+    openssl pkcs12 -in ~/tlscert/converted.pfx -clcerts -nokeys -out ~/tlscert/server.cert -passin file:/apps/pgsql/pghome/tlscert/kyfl &&
+
+    rm ~/tlscert/getall.pfx ~/tlscert/kyfl ~/tlscert/converted.pfx
+    cp ~/tlscert/server.cert ~/tlscert/root.cert
+    chmod 400 ~/tlscert/server.key
+    chmod 640 ~/tlscert/server.cert ~/tlscert/root.cert
+    cp ~/tlscert/root.cert /apps/pgsql/pghome/.postgresql/
+    sed -i '/tlscertdb/d' ~/.pgpass
+    echo -e "\n[Info] SSL Certificate Creation Completed Successfully\n"
+  else
+    echo -e  "\n[Info] Skipping as could not get Certificate data for this server\n"
+    sed -i '/tlscertdb/d' ~/.pgpass
+  fi
+EOF
+}
+
+pg_set_ssl_parameters()
+{
+  echo -e "\n[Info] Configuring Database Parameters For SSL\n"
+   su -l postgres<<'EOF'
+    if [ -s /apps/pgsql/pghome/tlscert/server.cert -a -s /apps/pgsql/pghome/tlscert/server.key ]
+    then
+    PGDAT=`grep PGDATA ~/.bash_profile|grep -v ^#|awk -F= '{print $2}'`
+    echo -e "ssl=on" >> "$PGDAT/init_postgres.conf"
+    echo -e ssl_ciphers=\''ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-CHACHA20-POLY1305:!aNULL'\' >> "$PGDAT/init_postgres.conf"
+   echo -e "ssl_cert_file='/apps/pgsql/pghome/tlscert/server.cert'" >> "$PGDAT/init_postgres.conf"
+   echo -e "ssl_key_file='/apps/pgsql/pghome/tlscert/server.key'" >> "$PGDAT/init_postgres.conf"
+   echo -e "ssl_ca_file='/apps/pgsql/pghome/tlscert/root.cert'" >> "$PGDAT/init_postgres.conf"
+
+    REPLLN=`egrep -n  '0.0.0.0\/0' "$PGDAT/pg_hba.conf"|grep 'replication'|cut -d':' -f1`
+    COMCONNLN=`egrep -n  '0.0.0.0\/0' "$PGDAT/pg_hba.conf"|grep -v 'replication'|cut -d':' -f1`
+
+    sed -i "$REPLLN s/host/hostssl/" "$PGDAT/pg_hba.conf"
+    sed -i "$COMCONNLN s/host/hostssl/" "$PGDAT/pg_hba.conf"
+    pg_ctl reload -D "$PGDAT" &&
+    echo -e "\n[Info] SSL Database Parameters Set in Place Successfully\n"
+else
+  echo -e "\n[Info] Failed to Configure Database Parameters For SSL as Creation of Certificate failed \n"
+fi
+EOF
+}
+
+pg_crt_repl_config()
+{
+echo -e "\n[Info] Creating Replication config file \n"
+NDID=$1
+USERHMDIR=`grep postgres /etc/passwd|awk -F ":" '{print $6}'`
+PBIN=`ls -d /usr/pgsql-*/bin`
+cat <<Eof >$USERHMDIR/repmgr.conf
+node_id=$NDID
+node_name=`hostname`
+conninfo='host=`hostname -f` user=postgres dbname=postgres port=9432 connect_timeout=10'
+data_directory='$PGDAT'
+use_replication_slots=yes
+log_file='/tmp/repmgrd.log'
+pg_bindir='$PBIN'
+pg_basebackup_options='--waldir=$PGWL'
+service_start_command = 'sudo systemctl start `echo $PGSVC|awk -F"/" '{print $6}'|sed -e 's/.service//'`'
+service_stop_command='sudo systemctl stop `echo $PGSVC|awk -F"/" '{print $6}'|sed -e 's/.service//'`'
+service_restart_command='sudo systemctl restart `echo $PGSVC|awk -F"/" '{print $6}'|sed -e 's/.service//'`'
+service_reload_command='sudo systemctl reload `echo $PGSVC|awk -F"/" '{print $6}'|sed -e 's/.service//'`'
+failover=manual
+promote_command='$PBIN/repmgr standby promote -f $USERHMDIR/repmgr.conf --log-to-file'
+follow_command='$PBIN/repmgr standby follow -f $USERHMDIR/repmgr.conf --log-to-file --upstream-node-id=%n'
+monitoring_history=yes
+monitor_interval_secs=10
+Eof
+chown postgres:postgres $USERHMDIR/repmgr.conf && chmod 600 $USERHMDIR/repmgr.conf
+}
+
+pg_reset_pwd()
+{
+  echo -e "\n[Info] Creating Postgres User and Adding required Extensions \n"
+
+  #apw=`echo "QXBwdXNy"|base64 -d`
+  APW=`date +%s | sha256sum | base64 | head -c 16 ; echo`
+  pgmonpw=`echo "YnUyejBmNQ=="|base64 -d`
+  CURTM=`date '+%h %d %T %Y'`
+  CURTM=`date -d "($CURTM) +1day" "+%h %d %T %Y"`
+  VUNTIL=`date -d "+3day" "+%h %d %Y"`
+  su - postgres <<Eof 2>/tmp/altusr_register.log
+  psql -q -p 9432 -c "alter user postgres password `echo \'$PGPWD\'`" > /dev/null
+  psql -q -p 9432 -c "create user pgs_monitor password `echo \'$pgmonpw\'`" > /dev/null
+  psql -q -p 9432 -c "create user ${APPNM}usr NOSUPERUSER NOCREATEDB CREATEROLE password `echo \'$APW\' valid until \'$VUNTIL\'`" > /dev/null
+  createdb ${APPNM}
+  psql -q -p 9432 ${APPNM} -c "create schema ${APPNM}usr"
+  psql -q -p 9432 ${APPNM} -c "ALTER SCHEMA ${APPNM}usr OWNER TO ${APPNM}usr"
+  psql -q -p 9432 ${APPNM} -c "GRANT ALL ON SCHEMA ${APPNM}usr to ${APPNM}usr"
+  psql -q -p 9432 ${APPNM} -c "GRANT CREATE ON DATABASE ${APPNM} to ${APPNM}usr"
+  psql -q -p 9432 -c "create extension pg_stat_statements" > /dev/null
+  psql -q -p 9432 ${APPNM} -c "create extension pg_stat_statements" > /dev/null
+  psql -q -p 9432 ${APPNM} -c "create extension vector" > /dev/null
+  repmgr -f $USERHMDIR/repmgr.conf primary register
+Eof
+}
+
+
+#pem_agent_parameter_change()
+#{
+# if [ `pgrep pemagent` ]
+#then
+# /usr/bin/systemctl stop pemagent
+# sed -i "s/allow_batch_probes=false/allow_batch_probes=true/g" /opt/edb/pem/agent/etc/agent.cfg
+# sed -i "s/heartbeat_connection=false/heartbeat_connection=true/g" /opt/edb/pem/agent/etc/agent.cfg
+# /usr/bin/systemctl start pemagent
+#else
+# sed -i "s/allow_batch_probes=false/allow_batch_probes=true/g" /opt/edb/pem/agent/etc/agent.cfg
+# sed -i "s/heartbeat_connection=false/heartbeat_connection=true/g" /opt/edb/pem/agent/etc/agent.cfg
+# /usr/bin/systemctl start pemagent
+#fi
+#echo "pem_agent_parameter_change:$?" >> /tmp/pgbuild.log
+#}
+
+pg_repmgrd_start()
+{
+ echo -e "\n[Info] Creating Softlink for repmgr and starting it up \n"
+ REPMGRLOC=`find /etc/repmgr/* -name repmgr*|cut -d "/" -f1,2,3,4`
+  find /etc/repmgr/* -type f -name repmgr.conf -execdir mv {} repmgr.conf.org \;
+  ln -s `cat /etc/passwd|grep postgres|awk -F":" '{print $6"/repmgr.conf"}'` $REPMGRLOC
+  chown -R postgres:postgres /etc/repmgr/
+#  su - postgres -c "repmgrd -d"  2>/tmp/repmgr_start.log
+}
+
+#install_pem_agent()
+#{
+# HNMDC=`hostname`;HNMDC=`echo \"$HNMDC\"`
+# FHNM=`hostname -f`
+# HNM=`hostname`
+# PP=`echo -n "ImMjciNjI3MiCg=="|base64 -d`
+# mkdir -p /apps/pgsql/pem_agent
+# tar xf $PICKEDTAR -C /apps/pgsql/pem_agent/ --wildcards 'pem*.run'
+# chown -R  postgres:postgres /apps/pgsql/pem_agent
+# ln -s /apps/pgsql/pem_agent/pem-agent* /usr/local/bin/install-pemagent
+# echo "Installing PEM agent"
+# /usr/local/bin/install-pemagent --mode unattended --pghost 10.253.30.93 --pgport 5431 --pgpassword `echo -n "YyNyI2Mjcw=="|base64 -d`  --agent_description `hostname`
+#
+#if [ $? -eq 0 ]
+#then
+#  pem_agent_parameter_change
+#fi  &&  echo "PEM Agent Installation Completed Successfully.."
+#
+#
+#printf "curl -s -i -X POST -d '{\"username\":\"postgres\",\"password\":`echo -n "ImMjciNjI3Mi"|base64 -d`}' -H \"Content-Type: application/json\" http://pemappprd01.isus.emc.com:8080/pem/api/token/|grep \"X-Subject-Token\"|awk -F\":\" '{print \$2}'|sed 's/^ //'|sed 's/\r//'" > ./get-token.sh
+# chmod u+x ./get-token.sh
+# TKN=`./get-token.sh`
+#
+#AGENTID=`grep agent_id /opt/edb/pem/agent/etc/agent.cfg|awk -F"=" '{print $2}'`
+#
+#curl -s -X POST -H "accept: application.json" -H "Content-type: application/json" \
+#-H "X-Auth-Token: "$TKN"" http://pemappprd01.isus.emc.com:8080/pem/api/v1/server/ -d '{"name": "'$APPNM'_on_'$HNM'", "host": '$HNMDC', "port": 9432, "database": "postgres", "ssl": 2, "serviceid": "", "active": true, "alert_blackout": false, "owner": 10, "server_owner": "postgres", "is_remote_monitoring": false, "username": "postgres", "gid": 1, "is_edb": false, "agent_id": '"$AGENTID"', "asb_host": '$HNMDC', "asb_port": 9432, "asb_username": "postgres", "asb_database": "postgres","asb_sslmode": "allow", "asb_password":'$PP',"server_group_name": "PEM Server Directory","agent_capability_list":["unix","getloadavg","disk_space","memory_usage","cpu_usage","network_statistics","io_analysis","data_log_file_analysis","disk_busy_info","os_statistics","os_info","slony_replication","auto_discover_servers","allow_server_restart","allow_batch_probes"]}' > /tmp/pem_db_registration.log
+#mkdir -p /var/log/pem;chown -R postgres:postgres /var/log/pem;chmod 700 /var/log/pem
+#
+#cat /tmp/pem_db_registration.log|awk -F "," '{print $2}'|sed -e "s/\"info\"/\"PEM Regiration of $APPNM on `hostname`\"/g"|sed 's/created/completed/g'|sed 's/"//g'|sed 's/:/ /g'
+# echo "install_pem_agent:$?" >> /tmp/pgbuild.log
+#}
+
+pg_pms_setup()
+{
+echo -e "\n[Info] Settig Up Postgres Monitoring System ..  \n"
+
+if [ ! `echo $HOSTNAME|egrep -Ei "^ptest|^zzz"` ]
+then
+mkdir -p $USERHMDIR/admin/sh/ne $USERHMDIR/admin/sh/ne-log $USERHMDIR/NodeExp/1.7.0
+tar xf $PICKEDTAR -C ${USERHMDIR}/admin/sh/ne/    pgmetrics.sh
+tar xf $PICKEDTAR -C ${USERHMDIR}/NodeExp/1.7.0/   node_exporter
+##Added line to to match Postgresql13 column name in pg_stat_statements
+  if [ `cat $PGDAT/PG_VERSION` -gt 12 ]
+  then
+   sed -i 's/total_time/total_exec_time/g' ${USERHMDIR}/admin/sh/ne/pgmetrics.sh
+  fi
+mv ${USERHMDIR}/admin/sh/ne/pgmetrics.sh ${USERHMDIR}/admin/sh/ne/.pgmetrics.sh
+ln -s "$USERHMDIR"/NodeExp/1.7.0/node_exporter -t "$USERHMDIR"/NodeExp
+chown -R postgres:postgres ${USERHMDIR}/*
+chmod 700 ${USERHMDIR}/admin/sh/ne/.pgmetrics.sh
+chmod 700 ${USERHMDIR}/NodeExp/1.7.0/node_exporter
+rm -f ${USERHMDIR}/admin/sh/pgmetrics.sh
+
+echo -e "\n[Info] Adding Node Exporter Service Unit\n"
+
+echo -e "[Unit]
+Description=Node Exporter
+After=network.target
+
+[Service]
+User=postgres
+
+Environment=EXECFL=/apps/pgsql/pghome/NodeExp/node_exporter
+Environment=COLTXTFL=/apps/pgsql/pghome/admin/sh/ne
+Environment=LOGFL=/apps/pgsql/pghome/admin/sh/ne-log/ne.log
+
+ExecStart=/usr/bin/sh -c 'exec \${EXECFL} --collector.textfile.directory=\${COLTXTFL} 2>>\${LOGFL}'
+
+ExecReload=/bin/kill -HUP \$MAINPID
+ExecStop=/usr/bin/kill -TERM \$MAINPID
+
+[Install]
+WantedBy=multi-user.target" > /etc/systemd/system/node-exporter.service
+
+echo -e "\n[Info] Adding PostgresMetrics Collector Service Unit\n"
+
+echo -e "[Unit]
+Description=PostgresMetricsCollector
+
+[Service]
+User=postgres
+Type=oneshot
+
+Environment=EXECFL=/apps/pgsql/pghome/admin/sh/ne/.pgmetrics.sh
+Environment=LOGFL=/apps/pgsql/pghome/admin/sh/ne-log/ne.log
+
+ExecStart=/usr/bin/sh -c '\${EXECFL} 2>> \${LOGFL}'
+" > /etc/systemd/system/pg-collectmetrics.service
+
+echo -e "\n[Info] Adding PostgresMetrics Collector Timer Service Unit\n"
+
+echo -e "[Unit]
+Description=PgMetricsCollectorTimer
+
+[Timer]
+OnCalendar=*:0/1
+AccuracySec=1
+
+[Install]
+WantedBy=timers.target" > /etc/systemd/system/pg-collectmetrics.timer
+
+echo -e "\n[Info] Adding Auto Rollover of Logfile \n"
+
+echo -e "/apps/pgsql/pghome/admin/sh/ne-log/ne.log {
+daily
+rotate 7
+compress
+missingok
+notifempty
+nodateext
+create 644 postgres postgres
+}" > /etc/logrotate.d/postgres
+
+cat <<Eof > /tmp/tg_`hostname -s`.yml
+- targets: ['`hostname -f`:9100']
+  labels:
+    job: '`hostname -f`'
+Eof
+
+echo -e "\n[Info] Adding Target to Prometheus Server For Monitoring and inserting DMMR record\n"
+
+#if [ "$ENVTYP" = 'PRD' ]
+if [[ ${ENVTYP^^} = "PRD" ]] || [[ ${ENVTYP^^} = "PROD" ]];then
+su - postgres -c '/usr/bin/ssh-keygen -t rsa -f ~/.ssh/id_rsa -q -P ""'
+su - postgres<<Eof
+echo -e  "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDM1JIbVSfWXRvKZhypKViABBvzddsZO7o0ElJsltEaZpxBhDzZJ6c4P/Jj7HoeaEBE2q0dttqKZM1vPfWmri6ITPIQRZtquwECeh3ZPeqQszUG5iAyN65To56K9J2I9gHoVGpICWJdnTSAk3n7UZ3u7XZTxTAWEEi3NppPgIg/3CB8BfL8kMjBCjdbjVCugA4rKX9jWLFISqXUbqJMi9N+ULPq5VkPuIkfjbQ5PfAIDX+1hiAwuMrfLJCe1Ybtv5miEzyGB7mNATw2Xi+oK7l5yonywvyuQubjG4rsb4CeIITuhJxCG4KK+BxmKUbgRyDG2xMpdBInBzifku3fhkub postgres@pmsplpgdprddb01.us.dell.com" > ~/.ssh/authorized_keys
+echo -e "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCil3oROFGXxCaURjJihcXTGuQ5vqNWLz0s7hmd6RAWCUuiDzpEkWR8t+dzZYZteSLqwphE8cHJz6MDyDl9TFFx3obzCO/8fcqsA1GEOA6JGJG5Qw+lNgLwTDqSYTLf45Fh3eoJKkRE2fRwJmGrN7glTlrRArC9vckt2mCrBqiyH3PAr6AZ3DgIVDwX4yuTNE9wkm0MLVLuR/e53Q5c2Y8sPrgxqsr9q3RyE9g/+jrFdJsuZN0QrcRsPSVTZb8WFtyPCCGMGotXX4L7kzJILx04w2SNKgYwgk4yO2H2u7dL6G8TOPyyHj7QmdqNxzmnXMF37tqR9fedlKaKkWjQS6E5 postgres@pmsplpgdprddb02.us.dell.com" >> ~/.ssh/authorized_keys
+Eof
+
+export DBV=`sudo su - postgres -c "pg_config --version"|awk '{print $2}'`
+export DBCONFDTL=`$PBIN/psql -qt postgres://dmmr:5nt3gr8t@pmsplpgp1pr11.amer.dell.com:9432,pmsplpgs3pr11.amer.dell.com:9432/pmsp?target_session_attrs=read-write -c"select ''''||'${HOSTNAME}'||''''||','||''''||'${APPNM}'||''''||','||''''||DATE_TRUNC('second',now()::timestamp)||''''||','||''''||'${DBV}'||''''||','||'9432'||','||''''||case when '${ENVTYP}' = 'PRD' then 'PROD' else 'NONPROD' end||''''||','||''''||'Y'||''''||','||''''||'N'||''''||','||''''||'$EMAILID'||''''||','||'NULL'"`
+
+
+$PBIN/psql -qt postgres://dmmr:5nt3gr8t@pmsplpgp1pr11.amer.dell.com:9432,pmsplpgs3pr11.amer.dell.com:9432/pmsp?target_session_attrs=read-write <<Eof
+insert into postgres_db_details values($DBCONFDTL);
+Eof
+
+
+curl -k -s -u svc_prdpromt:"tq~48x_U*?yVbWEocgJNfZ9a" -T /tmp/tg_`hostname -s`.yml  sftp://10.130.102.170/apps/prometheus/promthome/config/targets/
+curl -k -s -u svc_prdpromt:"tq~48x_U*?yVbWEocgJNfZ9a" -T /tmp/tg_`hostname -s`.yml  sftp://10.208.93.241/apps/prometheus/promthome/config/targets/
+else
+su - postgres -c '/usr/bin/ssh-keygen -t rsa -f ~/.ssh/id_rsa -q -P ""'
+su - postgres<<Eof
+echo -e "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDHala1/ZrL3SGX73949jcHulwam2J9XEin1bmtvKUHwjWqi1iSJmKoZ4JMYzU7D+bsxGDca6am5kveHY+QyZHMXjPW2+5aOM6/jcCn3BlzE/JgpwT0GvxA+wrY0j61Rx57QmVK1PBOM4qFUnzQZ6cHI5MJhA0KF4bceKYdQcFsHf3Bv+iupVTyeXeYSC8WhbPgH+BN+9IsL2tN/iVTSluFA+7Lf9AUqVMEgcZPWW1Pav92GpYcm0p39OSTNPVDUtDWV7hODkM9Io7vc9yDvDkzXN3IbwIA5GjxhAA2NeS+6xR+NhHLNZ4oVe7L0Lxirp5zXEvRBzOm1S0NxEUiV5N7 postgres@pmsnlpgrrde11.amer.dell.com" > ~/.ssh/authorized_keys
+echo -e  "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDM1JIbVSfWXRvKZhypKViABBvzddsZO7o0ElJsltEaZpxBhDzZJ6c4P/Jj7HoeaEBE2q0dttqKZM1vPfWmri6ITPIQRZtquwECeh3ZPeqQszUG5iAyN65To56K9J2I9gHoVGpICWJdnTSAk3n7UZ3u7XZTxTAWEEi3NppPgIg/3CB8BfL8kMjBCjdbjVCugA4rKX9jWLFISqXUbqJMi9N+ULPq5VkPuIkfjbQ5PfAIDX+1hiAwuMrfLJCe1Ybtv5miEzyGB7mNATw2Xi+oK7l5yonywvyuQubjG4rsb4CeIITuhJxCG4KK+BxmKUbgRyDG2xMpdBInBzifku3fhkub postgres@pmsplpgdprddb01.us.dell.com" >> ~/.ssh/authorized_keys
+echo -e "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCil3oROFGXxCaURjJihcXTGuQ5vqNWLz0s7hmd6RAWCUuiDzpEkWR8t+dzZYZteSLqwphE8cHJz6MDyDl9TFFx3obzCO/8fcqsA1GEOA6JGJG5Qw+lNgLwTDqSYTLf45Fh3eoJKkRE2fRwJmGrN7glTlrRArC9vckt2mCrBqiyH3PAr6AZ3DgIVDwX4yuTNE9wkm0MLVLuR/e53Q5c2Y8sPrgxqsr9q3RyE9g/+jrFdJsuZN0QrcRsPSVTZb8WFtyPCCGMGotXX4L7kzJILx04w2SNKgYwgk4yO2H2u7dL6G8TOPyyHj7QmdqNxzmnXMF37tqR9fedlKaKkWjQS6E5 postgres@pmsplpgdprddb02.us.dell.com" >> ~/.ssh/authorized_keys
+Eof
+export DBV=`sudo su - postgres -c "pg_config --version"|awk '{print $2}'`
+export DBCONFDTL=`$PBIN/psql -qt postgres://dmmr:5nt3gr8t@pmsnlpgrrde11.amer.dell.com:9432/pmsd -c"select ''''||'${HOSTNAME}'||''''||','||''''||'${APPNM}'||''''||','||''''||DATE_TRUNC('second',now()::timestamp)||''''||','||''''||'${DBV}'||''''||','||'9432'||','||''''||case when '${ENVTYP}' = 'PRD' then 'PROD' else 'NONPROD' end||''''||','||''''||'Y'||''''||','||''''||'N'||''''||','||''''||'$EMAILID'||''''||','||'NULL'"`
+
+
+$PBIN/psql -qt postgres://dmmr:5nt3gr8t@pmsnlpgrrde11.amer.dell.com:9432/pmsd <<Eof
+insert into postgres_db_details values($DBCONFDTL);
+Eof
+
+  curl -k -s -u svc_nppromt:"XmcD2jBH?EUIVn~+Y4Z_w9aF" -T /tmp/tg_`hostname -s`.yml  sftp://10.133.165.210/apps/prometheus/promthome/config/targets/
+fi
+
+echo -e "\nStating Monitoring Services.\n"
+systemctl start node-exporter.service
+sudo systemctl enable node-exporter.service
+systemctl enable pg-collectmetrics.timer
+sudo systemctl start pg-collectmetrics.timer
+rm /tmp/tg_`hostname -s`.yml
+else
+echo -e "[Info] Not Adding Target to PMS as Provisioned Host is For Testing\n"
+fi
+}
+
+
+pg_bkup_setup()
+{
+echo -e "\n[Info] Setting up Postgres Backup \n"
+
+if [ "$ISPRIMARY" = 'Y' -a "$ENVTYP" = 'PRD' ]
+then
+#cp ${REPOLOC}/pg_bkup.sh ${USERHMDIR}/admin/sh/
+#chown postgres:postgres ${USERHMDIR}/admin/sh/pg_bkup.sh
+chown postgres:postgres ${USERHMDIR}/admin/sh/*
+chmod 750 ${USERHMDIR}/admin/sh/*.sh
+su - postgres <<Eof
+(crontab -l 2>/dev/null; echo "`date +%M` `date +%H` * * * ${USERHMDIR}/admin/sh/pg_bkup.sh -h `hostname` -R 7 >/tmp/pg_bkup.log 2>&1")|crontab -
+(crontab -l 2>/dev/null; echo "05,15,25,35,45,55 * * * *  ${USERHMDIR}/admin/sh/wal_cleanup.sh 2>/tmp/wal_cleanup.log 2>&1")|crontab -
+Eof
+
+elif [ "$ISPRIMARY" = 'Y' -a "$ENVTYP" != 'PRD' ]
+then
+#cp ${REPOLOC}/pgdump_bkup.sh ${USERHMDIR}/admin/sh/
+#chown postgres:postgres ${USERHMDIR}/admin/sh/pgdump_bkup.sh
+chown postgres:postgres ${USERHMDIR}/admin/sh/*
+su - postgres <<Eof
+#(crontab -l 2>/dev/null; echo "`date +%M` `date +%H` * * * ${USERHMDIR}/admin/sh/pgdump_bkup.sh 2>/tmp/pgdump_bkup.log 2>&1")|crontab -
+(crontab -l 2>/dev/null; echo "05,15,25,35,45,55 * * * *  ${USERHMDIR}/admin/sh/wal_cleanup.sh 2>/tmp/wal_cleanup.log 2>&1")|crontab -
+Eof
+
+elif [ "$ISPRIMARY" != 'Y' -a "$ENVTYP" = 'PRD' ]
+then
+#cp ${REPOLOC}/pg_bkup.sh ${USERHMDIR}/admin/sh/
+#chown postgres:postgres ${USERHMDIR}/admin/sh/pg_bkup.sh
+chown postgres:postgres ${USERHMDIR}/admin/sh/*
+su - postgres <<Eof
+(crontab -l 2>/dev/null; echo "#`date +%M` `date +%H` * * * ${USERHMDIR}/admin/sh/pg_bkup.sh -h `hostname` -R 7 2 >/tmp/pg_bkup.log 2>&1")|crontab -
+(crontab -l 2>/dev/null; echo "05,15,25,35,45,55 * * * *  ${USERHMDIR}/admin/sh/wal_cleanup.sh 2>/tmp/wal_cleanup.log 2>&1")|crontab -
+Eof
+
+elif [ "$ISPRIMARY" != 'Y' -a "$ENVTYP" != 'PRD' ]
+then
+#cp ${REPOLOC}/pgdump_bkup.sh ${USERHMDIR}/admin/sh/
+#chown postgres:postgres ${USERHMDIR}/admin/sh/pgdump_bkup.sh
+chown postgres:postgres ${USERHMDIR}/admin/sh/*
+su - postgres <<Eof
+#(crontab -l 2>/dev/null; echo "#`date +%M` `date +%H` * * * ${USERHMDIR}/admin/sh/pgdump_bkup.sh 2>/tmp/pgdump_bkup.log 2>&1")|crontab -
+(crontab -l 2>/dev/null; echo "05,15,25,35,45,55 * * * *  ${USERHMDIR}/admin/sh/wal_cleanup.sh 2>/tmp/wal_cleanup.log 2>&1")|crontab -
+Eof
+fi
+}
+
+pg_sendout_email()
+{
+ echo -e "\n[Info] Sending Out Email\n"
+
+ REQSTR=`echo "$EMAILID"|awk -F"." '{print $1}'`
+ if [ ${ISPRIMARY} = "Y" ]
+ then
+ su - postgres <<Eof
+ echo -e "Greetings $REQSTR"'!'"\nThe requested DB sever has been provisioned successfully.\nPlease find the connection detail below\nDB Sever Name: `hostname -f` (IP Address:`hostname -i`)\n\t Port: 9432\n     database: ${APPNM}\n     Username:${APPNM}usr \n     Password:${APW} \n Note: Please change your password within 3 days.\n Use below command to change the password:\nExample: ALTER USER <USERNAME> PASSWORD '<NEW PASSWORD>' VALID UNTIL '$VUNTIL'"|/apps/pgsql/pghome/dbmailx -to "$EMAILID" -subject "Postgres DB Sever Provisioned Successfully"
+Eof
+else
+ su - postgres <<Eof
+ echo -e "Greetings $REQSTR"'!'"\nThe requested Replica Node has been added Successfully to the Primary host on ${PRMNDNM}."|/apps/pgsql/pghome/dbmailx -to "$EMAILID" -subject "Replica Node Provisioned Successfully"
+Eof
+fi
+}
+
+
+pg_postcheck()
+{
+ echo -e "\n[Info] Performing Postcheck Activity\n"
+
+ SVCTOCHECK=`echo $PGSVC|awk -F"/" '{print $6}'`
+ if [ -s $PGDAT/PG_VERSION -a `systemctl is-active $SVCTOCHECK` = 'active' ]
+  then
+  ls -Altr $PGDAT
+  ls -l $USERHMDIR/repmgr.conf
+  ls -ltr /usr/lib/systemd/system/$SVCTOCHECK
+  ps -ef|grep postgres
+  crontab -l -u postgres
+  cat /etc/sysctl.conf
+  cat /etc/security/limits.conf
+  pg_pms_setup
+  pg_sendout_email
+  echo -e "\n************** Build Completed Successfully ******************\n"
+ else
+  echo -e "\n[Error]: PostgresDB Creation Failed\n"
+  su - postgres << Eof
+  echo -e "Postgres Build On Server $HOSTNAME Failed"|/apps/pgsql/pghome/dbmailx -to "$EMAILID" -subject "Postgres DB Sever Provision Failed"
+Eof
+  exit 1
+ fi
+ rm -f /tmp/pginstall /tmp/postgres* > /dev/null 2>&1
+}
+
+enable_patroni()
+{
+su - postgres <<Eof
+ssh -q -o StrictHostKeyChecking=no -i /misc/software/database/postgres/pmsp01fl "${1}" "/apps/pgsql/pghome/admin/sh/pgsha AutoHAOn" >/tmp/autohaon.log 2>&1
+rm -fr /tmp/Patroni*
+Eof
+rm -fr /tmp/Patroni*
+}
+
+build_standalone(){
+  echo "Start time: `date`"
+  EMAILID=$4
+  REPOLOC=$2
+  ENVTYP=$3
+
+  pg_set_repoloc
+  add_unv_dba_login_and_postgres_sudo_privs
+  echo -e "\n[Info] Staring Installation and Setup of Postgres DB server on `hostname`\n"
+  pg_useradd
+  pg_mem_calc
+  pg_install_rpms
+  pg_filesystem_setup
+  pg_service_change
+  pg_db_init_for_repl
+  pg_kernel_config
+  pg_service_start
+  pg_add_sudo_rules
+  pg_open_firewall_port
+  pg_crt_pgpass
+  pg_certgen
+  pg_set_ssl_parameters
+  pg_crt_repl_config 1
+  pg_reset_pwd
+  pg_repmgrd_start
+  pg_bkup_setup
+  pg_postcheck
+  chown -R postgres:postgres /apps/pgsql/pghome /apps/pgsql/pgdump \
+  /apps/pgsql/pgtemp /apps/pgsql/pgdata01 \
+  /apps/pgsql/pgwal  /apps/pgsql/pgarchive
+  rm -fr $REPOLOC/*.tar
+  chown postgres:postgres /tmp/pgbuild.log && chmod 775 /tmp/pgbuild.log
+  echo "End time: `date`"
+}
+
+build_replica()
+{
+ echo "Replica Build Start time: `date`"
+ NDID=$1
+ PRMNDNM=$2
+ ENVTYP=$3
+ EMAILID=$4
+ REPOLOC=$5
+ ISPRIMARY='N'
+
+ pg_set_repoloc
+ add_unv_dba_login_and_postgres_sudo_privs
+ pg_useradd
+ pg_mem_calc
+ pg_install_rpms
+ pg_filesystem_setup
+ pg_service_change
+ pg_db_init_for_repl
+ pg_kernel_config
+ pg_crt_pgpass
+ pg_certgen
+ pg_crt_repl_config $1
+ pg_add_sudo_rules
+ pg_open_firewall_port
+ echo -e "\n[Info] Creating Standby(Replica) creation script \n"
+ echo -e "\n repmgr -h $PRMNDNM -U postgres -d postgres -f $USERHMDIR/repmgr.conf -c standby clone\n"
+ su - postgres -c "echo 'repmgr -h $PRMNDNM -U postgres -d postgres -f $USERHMDIR/repmgr.conf -c standby clone --upstream-node-id=1' > clone_standby.sh"
+        su - postgres -c "chmod u+x $USERHMDIR/clone_standby.sh"
+        echo -e "\n[Info] Building Standby(Replica) node\n"
+        su - postgres -c "$USERHMDIR/clone_standby.sh"
+        pg_service_start
+        echo -e "\n[Info] Registering Standby DB \n"
+        su - postgres -c "repmgr -f $USERHMDIR/repmgr.conf standby register --upstream-node-id=1"
+        rm -f $USERHMDIR/clone_standby.sh
+        pg_repmgrd_start
+        pg_bkup_setup
+        pg_postcheck
+       # chown -R postgres:postgres /apps
+        chown -R postgres:postgres /apps/pgsql/pghome /apps/pgsql/pgdump \
+        /apps/pgsql/pgtemp /apps/pgsql/pgdata01 \
+        /apps/pgsql/pgwal  /apps/pgsql/pgarchive
+        rm -fr $REPOLOC/*.tar
+        chown postgres:postgres /tmp/pgbuild.log && chmod 775 /tmp/pgbuild.log
+        enable_patroni "$PRMNDNM"
+        echo "Replica Build End time: `date`"
+}
+
+case "$1" in
+   "standalone")
+       if [ $# -le 4 ]
+       then
+           usage
+           exit 1
+         else
+          build_standalone $2 $6 $4 $5 2>&1|tee /tmp/pgbuild.log
+       fi
+        ;;
+    "replication")
+        if [ $# -le 6 ]
+        then
+         usage
+         exit 1
+        else
+         build_replica $4 $5 $6 $7 $8 2>&1|tee /tmp/pgbuild.log
+      fi
+        ;;
+
+    *) usage
+    ;;
+esac
